@@ -40,5 +40,5 @@ file-reopen = { git = "https://github.com/polachok/file-reopen.git", rev = "da89
 either = "1.6"
 actix-http = "2.2"
 
-#[patch.crates-io]
-#actix-http = { git = "https://github.com/polachok/actix-web", package = "actix-http", branch = "do-not-flush-headers" }
+[patch.crates-io]
+actix-http = { git = "https://github.com/polachok/actix-web", package = "actix-http", branch = "do-not-flush-headers" }
