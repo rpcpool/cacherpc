@@ -206,8 +206,10 @@ impl AccountUpdateManager {
             let stream_handle = AccountUpdateManager::add_stream(stream, ctx);
 
             let old = std::mem::replace(&mut actor.connection, Some((sink, stream_handle)));
-            if old.is_some() {
+            if let Some((mut sink, stream)) = old {
                 warn!(message = "old connection not canceled properly", actor_id = %actor_id);
+                sink.close();
+                ctx.cancel_future(stream);
             }
             metrics().websocket_connected.set(1);
             actor.last_received_at = Instant::now();
