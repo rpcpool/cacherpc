@@ -191,17 +191,6 @@ impl AccountUpdateManager {
         let fut = fut.into_actor(self).map(|conn, actor, ctx| {
             let (sink, stream) = futures_util::stream::StreamExt::split(conn);
             let actor_id = actor.actor_id;
-            let (sink, stream) = (
-                sink,
-                stream
-                    .take_while(move |item| {
-                        if let Err(err) = &item {
-                            warn!(message = "websocket error", error = %err, actor_id = %actor_id);
-                        }
-                        item.is_ok()
-                    })
-                    .filter_map(Result::ok),
-            );
             let sink = SinkWrite::new(sink, ctx);
             let stream_handle = AccountUpdateManager::add_stream(stream, ctx);
 
@@ -211,7 +200,7 @@ impl AccountUpdateManager {
                 sink.close();
                 ctx.cancel_future(stream);
             }
-            metrics().websocket_connected.set(1);
+            metrics().websocket_connected.inc();
             actor.last_received_at = Instant::now();
         });
         ctx.wait(fut);
@@ -554,7 +543,7 @@ impl AccountUpdateManager {
     fn reconnect(&mut self, ctx: &mut Context<Self>) {
         let actor_id = self.actor_id;
         info!(actor_id, "websocket disconnected");
-        metrics().websocket_connected.set(0);
+        metrics().websocket_connected.dec();
         metrics().subscriptions_active.set(0);
         self.connected.store(false, Ordering::Relaxed);
 
@@ -619,9 +608,22 @@ impl Handler<AccountCommand> for AccountUpdateManager {
     }
 }
 
-impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
-    fn handle(&mut self, item: awc::ws::Frame, ctx: &mut Context<Self>) {
+impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for AccountUpdateManager {
+    fn handle(
+        &mut self,
+        item: Result<awc::ws::Frame, awc::error::WsProtocolError>,
+        ctx: &mut Context<Self>,
+    ) {
         self.last_received_at = Instant::now();
+
+        let item = match item {
+            Ok(item) => item,
+            Err(err) => {
+                error!(error = %err, "websocket protocol error");
+                self.reconnect(ctx);
+                return;
+            }
+        };
 
         let _ = (|| -> Result<(), serde_json::Error> {
             use awc::ws::Frame;
@@ -732,7 +734,7 @@ impl Actor for AccountUpdateManager {
 
 impl actix::io::WriteHandler<awc::error::WsProtocolError> for AccountUpdateManager {
     fn error(&mut self, err: awc::error::WsProtocolError, ctx: &mut Self::Context) -> Running {
-        error!(message = "websocket error", error = ?err);
+        error!(message = "websocket write error", error = ?err);
         self.reconnect(ctx);
         Running::Continue
     }
