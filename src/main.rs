@@ -207,7 +207,7 @@ async fn run(options: Options) -> Result<()> {
             .data(state)
             .wrap(cors)
             .service(
-                web::resource("/")
+                web::resource("/*")
                     .route(
                         web::post()
                             .guard(guard::Header("content-type", "application/json"))
