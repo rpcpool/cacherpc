@@ -134,6 +134,7 @@ async fn run(options: cli::Options) -> Result<()> {
     let rules_path = options.rules.clone();
 
     let rpc_url = options.rpc_url;
+    let rpc_timeout = Duration::from_secs(options.rpc_timeout);
     let notify = Arc::new(Notify::new());
     let account_info_request_limit = Arc::new(SemaphoreQueue::new(
         config.rpc.request_queue_size.account_info,
@@ -199,6 +200,7 @@ async fn run(options: cli::Options) -> Result<()> {
             client,
             pubsub: pubsub.clone(),
             rpc_url: rpc_url.clone(),
+            rpc_timeout: rpc_timeout.clone(),
             map_updated: notify.clone(),
             account_info_request_limit: account_info_request_limit.clone(),
             program_accounts_request_limit: program_accounts_request_limit.clone(),

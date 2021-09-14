@@ -71,6 +71,12 @@ pub struct Options {
         help = "one of: 'plain', 'json'"
     )]
     pub log_format: LogFormat,
+    #[structopt(
+        long = "request-timeout",
+        default_value = "30",
+        help = "request timeout in seconds"
+    )]
+    rpc_timeout: u64,
     #[structopt(long = "log-file", help = "file path")]
     pub log_file: Option<std::path::PathBuf>,
     #[structopt(

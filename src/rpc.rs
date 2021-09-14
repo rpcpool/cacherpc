@@ -37,7 +37,7 @@ use crate::types::{
 #[cfg(feature = "jsonparsed")]
 use solana_sdk::pubkey::Pubkey as SolanaPubkey;
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const BODY_LIMIT: usize = 1024 * 1024 * 100;
 
 #[derive(Serialize)]
 struct JsonRpcResponse<'a, T> {
@@ -255,6 +255,7 @@ pub struct State {
     pub client: Client,
     pub pubsub: PubSubManager,
     pub rpc_url: String,
+    pub rpc_timeout: Duration,
     pub map_updated: Arc<Notify>,
     pub account_info_request_limit: Arc<SemaphoreQueue>,
     pub program_accounts_request_limit: Arc<SemaphoreQueue>,
@@ -398,7 +399,7 @@ impl State {
             let body = client
                 .post(&self.rpc_url)
                 .append_header(("X-Cache-Request-Method", req.method))
-                .timeout(REQUEST_TIMEOUT)
+                .timeout(self.rpc_timeout)
                 .send_json(&req)
                 .await;
             metrics()
