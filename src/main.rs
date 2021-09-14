@@ -218,7 +218,9 @@ async fn run(options: Options) -> Result<()> {
                 web::resource("/*")
                     .route(
                         web::post()
-                            .guard(guard::Header("content-type", "application/json"))
+                            .guard(guard::fn_guard(
+																	|req| req.headers()
+																		 .contains_key("content-type"))) // @TODO: actually check that content-type STARTS with application/json
                             .to(rpc::rpc_handler),
                     )
                     .route(web::post().to(rpc::bad_content_type_handler)),
