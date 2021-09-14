@@ -29,7 +29,6 @@ use crate::types::{
 };
 
 const BODY_LIMIT: usize = 1024 * 1024 * 100;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Serialize)]
 struct JsonRpcResponse<'a, T> {
@@ -196,6 +195,7 @@ pub struct State {
     pub client: Client,
     pub pubsub: crate::accounts::PubSubManager,
     pub rpc_url: String,
+    pub rpc_timeout: Duration,
     pub map_updated: Arc<Notify>,
     pub account_info_request_limit: Arc<Semaphore>,
     pub program_accounts_request_limit: Arc<Semaphore>,
@@ -267,7 +267,7 @@ impl State {
                 .start_timer();
             let mut resp = client
                 .post(&self.rpc_url)
-                .timeout(REQUEST_TIMEOUT)
+                .timeout(self.rpc_timeout)
                 .send_json(&req)
                 .await?;
             let body = resp.body().limit(BODY_LIMIT).await;

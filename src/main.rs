@@ -70,6 +70,12 @@ struct Options {
         help = "one of: 'plain', 'json'"
     )]
     log_format: LogFormat,
+    #[structopt(
+        long = "request-timeout",
+        default_value = "30",
+        help = "request timeout in seconds"
+    )]
+    rpc_timeout: u64,
     #[structopt(long = "log-file", help = "file path")]
     log_file: Option<std::path::PathBuf>,
     #[structopt(
@@ -162,6 +168,7 @@ async fn run(options: Options) -> Result<()> {
     );
 
     let rpc_url = options.rpc_url;
+    let rpc_timeout = Duration::from_secs(options.rpc_timeout);
     let notify = Arc::new(Notify::new());
     let account_info_request_limit = Arc::new(Semaphore::new(options.account_info_request_limit));
     let program_accounts_request_limit =
@@ -190,6 +197,7 @@ async fn run(options: Options) -> Result<()> {
             client,
             pubsub: pubsub.clone(),
             rpc_url: rpc_url.clone(),
+            rpc_timeout: rpc_timeout.clone(),
             map_updated: notify.clone(),
             account_info_request_limit: account_info_request_limit.clone(),
             program_accounts_request_limit: program_accounts_request_limit.clone(),
