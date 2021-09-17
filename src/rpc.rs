@@ -30,8 +30,6 @@ use crate::types::{
     Encoding, Filter, ProgramAccountsDb, Pubkey, SolanaContext,
 };
 
-const BODY_LIMIT: usize = 1024 * 1024 * 100;
-
 #[derive(Serialize)]
 struct JsonRpcResponse<'a, T> {
     jsonrpc: &'a str,
