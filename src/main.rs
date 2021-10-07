@@ -296,12 +296,12 @@ async fn run(options: Options) -> Result<()> {
         App::new()
             .data(state)
             .wrap(cors)
+            .service(web::resource("/metrics").route(web::get().to(rpc::metrics_handler)))
             .service(
                 web::resource("/*")
                     .route(web::post().guard(content_type_guard).to(rpc::rpc_handler))
                     .route(web::post().to(rpc::bad_content_type_handler)),
             )
-            .service(web::resource("/metrics").route(web::get().to(rpc::metrics_handler)))
     })
     .bind(bind_addr)
     .with_context(|| format!("failed to bind to {}", bind_addr))?
