@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,9 +17,9 @@ use tokio::sync::{watch, Notify, Semaphore};
 use tracing::info;
 use tracing_subscriber::fmt;
 
-pub use cache_rpc::{accounts, metrics, rpc, types};
+pub use cache_rpc::{metrics, pubsub, rpc, types};
 
-use accounts::PubSubManager;
+use pubsub::PubSubManager;
 use types::{AccountsDb, ProgramAccountsDb};
 
 #[derive(Debug, structopt::StructOpt)]
@@ -96,6 +96,12 @@ struct Options {
         parse(try_from_str = humantime::parse_duration)
     )]
     time_to_live: Duration,
+
+    #[structopt(
+        long = "ignore-base58-limit",
+        help = "ignore base58 overflowing size limit"
+    )]
+    ignore_base58: bool,
     #[structopt(long = "config", help = "config path")]
     config: Option<PathBuf>,
 }
@@ -182,6 +188,7 @@ impl Config {
                     account_info: options.account_info_request_limit,
                     program_accounts: options.program_accounts_request_limit,
                 },
+                ignore_base58_limit: options.ignore_base58,
             },
         }
     }
@@ -211,12 +218,19 @@ async fn run(options: Options) -> Result<()> {
     let accounts = AccountsDb::new();
     let program_accounts = ProgramAccountsDb::new();
 
+    let rpc_slot = Arc::new(AtomicU64::new(0));
+    let _rpc_monitor = cache_rpc::rpc_monitor::RpcMonitor::init(
+        &options.rpc_url,
+        Client::default(),
+        rpc_slot.clone(),
+    );
     let pubsub = PubSubManager::init(
         options.websocket_connections,
         accounts.clone(),
         program_accounts.clone(),
         &options.ws_url,
         options.time_to_live,
+        rpc_slot.clone(),
     );
 
     let config_file = options
