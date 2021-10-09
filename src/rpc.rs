@@ -7,6 +7,7 @@ use std::fmt::{self, Debug};
 use std::sync::Arc;
 use std::time::Duration;
 
+use actix_http::error::PayloadError;
 use actix_web::{web, HttpResponse, ResponseError};
 use arc_swap::ArcSwap;
 use awc::Client;
@@ -243,7 +244,7 @@ impl State {
         T: Serialize + Debug + ?Sized,
     {
         let client = &self.client;
-        let mut backoff = backoff_settings();
+        let mut backoff = backoff_settings(60);
         loop {
             let wait_time = metrics()
                 .wait_time
@@ -281,7 +282,7 @@ impl State {
         raw_request: Request<'_, RawValue>,
     ) -> CacheResult<'_> {
         let request = T::parse(&raw_request)?;
-        let is_cacheable = match request
+        let (is_cacheable, can_use_cache) = match request
             .is_cacheable(&self)
             .map(|_| request.get_from_cache(&raw_request.id, &self))
         {
@@ -290,13 +291,24 @@ impl State {
                 self.reset(request.sub_descriptor());
                 return data;
             }
-            Ok(None) => true,
+            Ok(None) => (true, true),
             Err(reason) => {
+                let data = reason
+                    .can_use_cache()
+                    .then(|| request.get_from_cache(&raw_request.id, &self))
+                    .flatten();
+
+                if let Some(data) = data {
+                    T::cache_hit_counter().inc();
+                    self.reset(request.sub_descriptor());
+                    return data;
+                }
+
                 metrics()
                     .response_uncacheable
                     .with_label_values(&[T::REQUEST_TYPE, reason.as_str()])
                     .inc();
-                false
+                (false, reason.can_use_cache())
             }
         };
 
@@ -313,7 +325,7 @@ impl State {
                         Error::Timeout(raw_request.id.clone())
                     })?;
                 }
-                _ = notified, if is_cacheable => {
+                _ = notified, if can_use_cache => {
                     if let Some(data) = request.get_from_cache(&raw_request.id, &self) {
                         T::cache_hit_counter().inc();
                         T::cache_filled_counter().inc();
@@ -655,6 +667,14 @@ impl UncacheableReason {
             Self::Inactive => "inactive_sub",
             Self::DataSlice => "data_slice",
             Self::Filters => "bad_filters",
+        }
+    }
+
+    /// Returns true if the request can still be fetched from cache
+    fn can_use_cache(&self) -> bool {
+        match self {
+            Self::DataSlice => true,
+            Self::Encoding | Self::Inactive | Self::Filters => false,
         }
     }
 }
@@ -1277,9 +1297,10 @@ pub async fn rpc_handler(
 
     let client = app_state.client.clone();
     let url = app_state.rpc_url.clone();
+    let mut error = Error::Timeout(req.id.clone()).error_response();
 
     let stream = stream_generator::generate_stream(move |mut stream| async move {
-        let mut backoff = backoff_settings();
+        let mut backoff = backoff_settings(30);
         let total = metrics().passthrough_total_time.start_timer();
         loop {
             let request_time = metrics().passthrough_request_time.start_timer();
@@ -1304,8 +1325,13 @@ pub async fn rpc_handler(
                     match backoff.next_backoff() {
                         Some(duration) => tokio::time::delay_for(duration).await,
                         None => {
+                            let mut error_stream = error.take_body();
                             warn!("request error: {:?}", err);
-                            // TODO: return error
+                            while let Some(chunk) = error_stream.next().await {
+                                stream
+                                    .send(chunk.map_err(|_| PayloadError::Incomplete(None))) // should never error
+                                    .await;
+                            }
                             break;
                         }
                     }
@@ -1320,11 +1346,11 @@ pub async fn rpc_handler(
         .streaming(Box::pin(stream)))
 }
 
-fn backoff_settings() -> backoff::ExponentialBackoff {
+fn backoff_settings(max: u64) -> backoff::ExponentialBackoff {
     backoff::ExponentialBackoff {
         initial_interval: Duration::from_millis(100),
         max_interval: Duration::from_secs(5),
-        max_elapsed_time: Some(Duration::from_secs(60)),
+        max_elapsed_time: Some(Duration::from_secs(max)),
         ..Default::default()
     }
 }
@@ -1372,6 +1398,7 @@ pub struct Config {
 
 pub async fn apply_config(app_state: &web::Data<State>, new_config: Config) {
     let current_config = app_state.config.load();
+
     if **current_config == new_config {
         return;
     }
@@ -1379,7 +1406,7 @@ pub async fn apply_config(app_state: &web::Data<State>, new_config: Config) {
     let current_limits = current_config.request_limits;
     let new_limits = new_config.request_limits;
 
-    app_state.config.store(Arc::new(new_config));
+    app_state.config.store(Arc::new(new_config.clone()));
 
     async fn apply_limit(old_limit: usize, new_limit: usize, semaphore: &Semaphore) {
         if new_limit > old_limit {
@@ -1407,10 +1434,14 @@ pub async fn apply_config(app_state: &web::Data<State>, new_config: Config) {
 
     let available_accounts = &app_state.account_info_request_limit.available_permits();
     let available_programs = &app_state.program_accounts_request_limit.available_permits();
-    info!(old = ?current_limits,
-        new = ?new_limits,
+
+    info!(
+        old_config = ?current_config,
+        new_config = ?new_config,
         %available_accounts,
-        %available_programs, "rpc limits updated");
+        %available_programs,
+        "new configuration applied"
+    );
 }
 
 pub async fn metrics_handler(

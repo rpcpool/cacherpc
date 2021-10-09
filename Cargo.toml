@@ -1,6 +1,6 @@
 [package]
 name = "cache-rpc"
-version = "0.1.31"
+version = "0.1.32"
 authors = ["Alexander Polakov <a.polakov@iconic.vc>"]
 edition = "2018"
 license = "MIT"
@@ -54,3 +54,4 @@ harness = false
 
 [patch.crates-io]
 actix-http = { git = "https://github.com/polachok/actix-web", rev = "19cd7fdbd5b79e9d78c8cb562741d7513d980b18" }
+actix = { git = "https://github.com/polachok/actix", rev = "58e5309310cccd38ce9b75141547a67610454759" }

@@ -104,6 +104,13 @@ struct Options {
     ignore_base58: bool,
     #[structopt(long = "config", help = "config path")]
     config: Option<PathBuf>,
+    #[structopt(
+        long = "slot-distance",
+        short = "d",
+        help = "Health check slot distance",
+        default_value = "150"
+    )]
+    slot_distance: u32,
 }
 
 #[derive(Debug)]
@@ -202,8 +209,8 @@ async fn config_read_loop(path: PathBuf, rpc: watch::Sender<rpc::Config>) {
         match File::open(&path) {
             Ok(file) => match Config::from_file(file) {
                 Ok(config) => {
+                    info!(?config, "configuration reloaded");
                     let _ = rpc.broadcast(config.rpc);
-                    info!("config reloaded");
                 }
                 Err(err) => tracing::error!(error = %err, path = ?path, "error parsing config"),
             },
@@ -228,9 +235,12 @@ async fn run(options: Options) -> Result<()> {
         options.websocket_connections,
         accounts.clone(),
         program_accounts.clone(),
-        &options.ws_url,
-        options.time_to_live,
         rpc_slot.clone(),
+        pubsub::Config {
+            websocket_url: options.ws_url.to_owned(),
+            ttl: options.time_to_live,
+            slot_distance: options.slot_distance,
+        },
     );
 
     let config_file = options
