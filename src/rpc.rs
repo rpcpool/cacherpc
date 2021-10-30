@@ -16,6 +16,7 @@ use bytes::Bytes;
 use dashmap::mapref::one::Ref;
 use futures_util::stream::Stream;
 use lru::LruCache;
+use mlua::Lua;
 use prometheus::IntCounter;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::value::{to_raw_value, RawValue};
@@ -260,6 +261,7 @@ pub struct State {
     pub config_watch: RefCell<watch::Receiver<Config>>,
     pub lru: RefCell<LruCache<u64, LruEntry>>,
     pub worker_id: String,
+    pub lua: Option<Lua>,
 }
 
 impl State {
@@ -331,6 +333,29 @@ impl State {
         self: Arc<Self>,
         raw_request: Request<'_, RawValue>,
     ) -> CacheResult<'_> {
+        if let Some(lua) = &self.lua {
+            let res = lua.scope(|scope| {
+                lua.globals()
+                    .set("request", scope.create_nonstatic_userdata(&raw_request)?)?;
+                lua.load("require 'waf'.request(request)")
+                    .eval::<(bool, String)>()
+            });
+
+            let (ok, err) = match res {
+                Ok(tuple) => tuple,
+                Err(e) => {
+                    tracing::error!(%e, "Error occured during WAF rules evaluation");
+                    return Err(Error::Internal(
+                        Some(raw_request.id.clone()),
+                        Cow::from("WAF internal error"),
+                    ));
+                }
+            };
+            if !ok {
+                return Err(Error::WAFRejection(Some(raw_request.id.clone()), err));
+            }
+        }
+
         let request = T::parse(&raw_request)?;
         let (is_cacheable, can_use_cache) = match request
             .is_cacheable(&self)
@@ -524,7 +549,19 @@ impl Cacheable for GetAccountInfo {
 
     fn get_from_cache<'a>(&self, id: &Id<'a>, state: &State) -> Option<CacheResult<'a>> {
         state.accounts.get(&self.pubkey).and_then(|data| {
-            let account = data.value().get(self.commitment());
+            let mut account = data.value().get(self.commitment());
+            account = account.map(|(info, mut slot)| {
+                if slot == 0 {
+                    if let Some(info) = info {
+                        if let Some(owner) = state.program_accounts.get(&info.owner, None) {
+                            if let Some(s) = owner.value().get_slot(self.commitment()) {
+                                slot = *s;
+                            }
+                        }
+                    }
+                }
+                (info, slot)
+            });
             match account.filter(|(_, slot)| *slot != 0) {
                 Some(data) => {
                     let resp = account_response(
@@ -763,6 +800,14 @@ where
     pub params: Option<&'a T>,
 }
 
+impl<'a, 'b> mlua::UserData for &'b Request<'a, RawValue> {
+    fn add_fields<'lua, F: mlua::UserDataFields<'lua, Self>>(fields: &mut F) {
+        fields.add_field_method_get("jsonrpc", |_, this| Ok(this.jsonrpc));
+        fields.add_field_method_get("method", |_, this| Ok(this.method));
+        fields.add_field_method_get("params", |_, this| Ok(this.params.map(|v| v.get())));
+    }
+}
+
 #[derive(Deserialize, Debug)]
 pub struct Flatten<T> {
     #[serde(flatten)]
@@ -833,6 +878,30 @@ impl<'a> ErrorResponse<'a> {
         }
     }
 
+    fn internal(id: Option<Id<'a>>, msg: Cow<'a, str>) -> ErrorResponse<'a> {
+        ErrorResponse {
+            jsonrpc: "2.0",
+            id,
+            error: RpcError {
+                code: -32603,
+                message: msg,
+                data: None,
+            },
+        }
+    }
+
+    fn waf_rejection(id: Option<Id<'a>>, msg: &'a str) -> ErrorResponse<'a> {
+        ErrorResponse {
+            jsonrpc: "2.0",
+            id,
+            error: RpcError {
+                code: -33000,
+                message: Cow::from(msg),
+                data: None,
+            },
+        }
+    }
+
     fn invalid_request(id: Option<Id<'a>>, msg: Option<&'a str>) -> ErrorResponse<'a> {
         ErrorResponse {
             jsonrpc: "2.0",
@@ -874,6 +943,8 @@ impl<'a> ErrorResponse<'a> {
 pub enum Error<'a> {
     #[error("invalid request")]
     InvalidRequest(Option<Id<'a>>, Option<&'a str>),
+    #[error("waf rejection error")]
+    WAFRejection(Option<Id<'a>>, String),
     #[error("invalid param")]
     InvalidParam {
         req_id: Id<'a>,
@@ -890,6 +961,8 @@ pub enum Error<'a> {
     Forward(#[from] awc::error::SendRequestError),
     #[error("streaming error")]
     Streaming(awc::error::PayloadError),
+    #[error("internal error")]
+    Internal(Option<Id<'a>>, Cow<'a, str>),
 }
 
 impl From<serde_json::Error> for Error<'_> {
@@ -910,6 +983,9 @@ impl ResponseError for Error<'_> {
             Error::InvalidRequest(req_id, msg) => HttpResponse::Ok()
                 .content_type("application/json")
                 .json(&ErrorResponse::invalid_request(req_id.clone(), *msg)),
+            Error::WAFRejection(req_id, msg) => HttpResponse::Ok()
+                .content_type("application/json")
+                .json(&ErrorResponse::waf_rejection(req_id.clone(), msg)),
             Error::InvalidParam {
                 req_id,
                 message,
@@ -917,6 +993,9 @@ impl ResponseError for Error<'_> {
             } => HttpResponse::Ok().content_type("application/json").json(
                 &ErrorResponse::invalid_param(req_id.clone(), message.clone(), data.clone()),
             ),
+            Error::Internal(req_id, msg) => HttpResponse::Ok()
+                .content_type("application/json")
+                .json(&ErrorResponse::internal(req_id.clone(), msg.clone())),
             Error::Parsing(req_id) => HttpResponse::Ok()
                 .content_type("application/json")
                 .json(&ErrorResponse::parse_error(req_id.clone())),
@@ -993,8 +1072,8 @@ fn parse_params<'a, T: Default + Deserialize<'a>>(
     if params.len() > 2 {
         return Err(Error::InvalidParam {
             req_id: req.id.clone(),
-            message: "Expected from 1 to 2 parameters".into(),
-            data: Some(format!("Got {}", params.len()).into()),
+            message: "Invalid parameters: Expected from 1 to 2 parameters".into(),
+            data: Some(format!("\"Got {}\"", params.len()).into()),
         });
     }
 
@@ -1303,6 +1382,46 @@ fn base58_error(id: Id<'_>) -> Error<'_> {
     )
 }
 
+enum OneOrMany<'a> {
+    One(Request<'a, RawValue>),
+    Many(Vec<&'a RawValue>),
+}
+
+impl<'de> Deserialize<'de> for OneOrMany<'de> {
+    fn deserialize<D>(deserializer: D) -> Result<OneOrMany<'de>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = OneOrMany<'de>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("[] or {}")
+            }
+
+            fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let des = serde::de::value::SeqAccessDeserializer::new(seq);
+                Ok(OneOrMany::Many(serde::Deserialize::deserialize(des)?))
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let des = serde::de::value::MapAccessDeserializer::new(map);
+                Ok(OneOrMany::One(serde::Deserialize::deserialize(des)?))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 pub async fn rpc_handler(
     body: Bytes,
     app_state: web::Data<State>,
@@ -1310,29 +1429,13 @@ pub async fn rpc_handler(
     use std::future::Future;
     use std::task::Poll;
 
-    let req: Request<'_, _> = match serde_json::from_slice(&body) {
-        Ok(req) => req,
-        Err(_) => {
-            return Ok(Error::InvalidRequest(None, Some("Invalid request")).error_response());
-        }
+    // if request contains subqueries, pass it directly to validator
+    let req: OneOrMany<'_> = match serde_json::from_slice(&body) {
+        Ok(val) => val,
+        Err(_) => return Ok(Error::InvalidRequest(None, Some("Invalid request")).error_response()),
     };
 
-    if req.jsonrpc != "2.0" {
-        return Ok(Error::InvalidRequest(Some(req.id), None).error_response());
-    }
-
-    macro_rules! observe {
-        ($method:expr, $fut:expr) => {{
-            metrics().request_types($method).inc();
-            let timer = metrics()
-                .handler_time
-                .with_label_values(&[$method])
-                .start_timer();
-            let resp = $fut.await;
-            timer.observe_duration();
-            Ok(resp.unwrap_or_else(|err| err.error_response()))
-        }};
-    }
+    // apply new config (if any) before proceeding
     {
         let mut rx = app_state.config_watch.borrow_mut();
 
@@ -1350,25 +1453,50 @@ pub async fn rpc_handler(
         }
     }
 
-    let arc_state = app_state.clone().into_inner();
-    match req.method {
-        "getAccountInfo" => {
-            return observe!(req.method, arc_state.process_request::<GetAccountInfo>(req));
+    let mut id = Id::Null;
+
+    // if request contains only one query, try to serve it from cache
+    if let OneOrMany::One(req) = req {
+        if req.jsonrpc != "2.0" {
+            return Ok(Error::InvalidRequest(Some(req.id), None).error_response());
         }
-        "getProgramAccounts" => {
-            return observe!(
-                req.method,
-                arc_state.process_request::<GetProgramAccounts>(req)
-            );
+
+        macro_rules! observe {
+            ($method:expr, $fut:expr) => {{
+                metrics().request_types($method).inc();
+                let timer = metrics()
+                    .handler_time
+                    .with_label_values(&[$method])
+                    .start_timer();
+                let resp = $fut.await;
+                timer.observe_duration();
+                Ok(resp.unwrap_or_else(|err| err.error_response()))
+            }};
         }
-        method => {
-            metrics().request_types(method).inc();
+
+        let arc_state = app_state.clone().into_inner();
+        match req.method {
+            "getAccountInfo" => {
+                return observe!(req.method, arc_state.process_request::<GetAccountInfo>(req));
+            }
+            "getProgramAccounts" => {
+                return observe!(
+                    req.method,
+                    arc_state.process_request::<GetProgramAccounts>(req)
+                );
+            }
+            method => {
+                metrics().request_types(method).inc();
+                id = req.id;
+            }
         }
+    } else {
+        metrics().batch_requests.inc();
     }
 
     let client = app_state.client.clone();
     let url = app_state.rpc_url.clone();
-    let mut error = Error::Timeout(req.id.clone()).error_response();
+    let mut error = Error::Timeout(id).error_response();
 
     let stream = stream_generator::generate_stream(move |mut stream| async move {
         let mut backoff = backoff_settings(30);
