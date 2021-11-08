@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use actix::fut::{ActorFuture, WrapFuture};
+use actix::fut::{ActorFutureExt, WrapFuture};
 use actix::prelude::{Actor, Addr, AsyncContext, Context, Handler, Message};
 use awc::Client;
 use serde::Serialize;
@@ -97,7 +97,13 @@ impl RpcMonitor {
             .send_json(&request)
             .await
             .map_err(|err| anyhow::Error::msg(err.to_string()))?;
-        let resp = resp.json::<Flatten<Response<Resp>>>().await?;
+        let resp = match resp.json::<Flatten<Response<Resp>>>().await {
+            Ok(res) => res,
+            Err(e) => {
+                warn!(?resp, "Failed to parse JSON reponse");
+                return Err(anyhow::Error::from(e));
+            }
+        };
         match resp.inner {
             Response::Result(resp) => Ok(resp),
             Response::Error(err) => {
