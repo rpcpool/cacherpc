@@ -64,7 +64,7 @@ pub struct Options {
         default_value = "30",
         help = "request timeout in seconds"
     )]
-    rpc_timeout: u64,
+    pub rpc_timeout: u64,
     #[structopt(long = "log-file", help = "file path")]
     pub log_file: Option<std::path::PathBuf>,
     #[structopt(
