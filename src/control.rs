@@ -1,5 +1,5 @@
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{atomic::AtomicBool, Arc},
 };
 
@@ -9,10 +9,8 @@ use serde::Deserialize;
 use tokio::sync::watch::Sender;
 use tracing::{info, warn};
 
-use crate::{
-    cli::{Command, Config},
-    rpc,
-};
+use crate::cli::{Command, Config};
+use crate::rpc;
 
 pub const CACHER_SOCKET_DEFAULT: &str = "/run/cacherpc.sock";
 
@@ -21,6 +19,7 @@ pub struct ControlState {
     rpc_config_sender: Option<RpcConfigSender>,
     subscriptions_allowed: Arc<AtomicBool>,
     socket_path: PathBuf,
+    waf_tx: Arc<Sender<()>>,
 }
 
 impl ControlState {
@@ -28,14 +27,18 @@ impl ControlState {
         subscriptions_allowed: Arc<AtomicBool>,
         rpc_config_sender: Option<RpcConfigSender>,
         socket_path: PathBuf,
+        waf_tx: Sender<()>,
     ) -> Self {
         if rpc_config_sender.is_none() {
             warn!("No configuration file was set up");
         }
+        let waf_tx = Arc::new(waf_tx);
+
         ControlState {
             rpc_config_sender,
             subscriptions_allowed,
             socket_path,
+            waf_tx,
         }
     }
 }
@@ -55,18 +58,33 @@ impl RpcConfigSender {
 pub async fn run_control_interface(state: ControlState) {
     info!("Starting control interface");
     let state_clone = state.clone();
-    HttpServer::new(move || {
+    let uds = HttpServer::new(move || {
         App::new()
             .app_data(Data::new(state_clone.clone()))
             .service(subscriptions_allowed_handler)
             .service(config_reloader)
+            .service(waf_reloader)
     })
     .workers(1)
-    .bind_uds(state.socket_path)
-    .unwrap()
-    .run()
-    .await
-    .unwrap();
+    .bind_uds(&state.socket_path);
+    match uds {
+        Ok(server) => {
+            if let Err(error) = server.run().await {
+                warn!(
+                    %error,
+                    path=?state.socket_path,
+                    "Failed to run control interface server"
+                );
+            }
+        }
+        Err(error) => {
+            warn!(
+                %error,
+                path=?state.socket_path,
+                "Failed to bind control interface to UDS at given path"
+            );
+        }
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -117,12 +135,20 @@ async fn config_reloader(state: Data<ControlState>) -> Result<HttpResponse, Cont
     }
 }
 
+#[post("/waf/reload")]
+async fn waf_reloader(state: Data<ControlState>) -> Result<HttpResponse, ControlError> {
+    state.waf_tx.send(()).map_err(|_| ControlError::NoWAFFile)?;
+    Ok(HttpResponse::Ok().body(AnyBody::from_slice(b"OK")))
+}
+
 #[derive(Debug, thiserror::Error)]
 enum ControlError {
     #[error("Bad request")]
     BadRequest,
     #[error("No configuration file is set up")]
     NoConfigFile,
+    #[error("No WAF file is set up")]
+    NoWAFFile,
     #[error("Configuration file cannot be read")]
     BadConfigFile,
 }
@@ -134,6 +160,8 @@ impl ResponseError for ControlError {
                 .set_body(AnyBody::from_slice(b"Request not supported")),
             ControlError::NoConfigFile => HttpResponse::new(StatusCode::NOT_FOUND)
                 .set_body(AnyBody::from_slice(b"Configuration file is not set up")),
+            ControlError::NoWAFFile => HttpResponse::new(StatusCode::NOT_FOUND)
+                .set_body(AnyBody::from_slice(b"WAF file is not set up")),
             ControlError::BadConfigFile => HttpResponse::new(StatusCode::CONFLICT)
                 .set_body(AnyBody::from_slice(b"Configuration file couldn't be read")),
         }
@@ -142,7 +170,7 @@ impl ResponseError for ControlError {
 
 pub async fn handle_command(
     cmd: &Command,
-    socket_path: PathBuf,
+    socket_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use awc::{Client, Connector};
     use awc_uds::UdsConnector;
